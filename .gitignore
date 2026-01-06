@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (keep structure via .gitkeep)
+data/raw_logs/*
+data/processed/*
+!data/raw_logs/.gitkeep
+!data/processed/.gitkeep
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
