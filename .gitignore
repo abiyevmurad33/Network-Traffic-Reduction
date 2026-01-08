@@ -24,3 +24,8 @@ data/processed/*
 Thumbs.db
 .vscode/
 .idea/
+
+# Doom IWAD assets (local-only)
+freedoom2.wad
+doom.wad
+doom2.wad
