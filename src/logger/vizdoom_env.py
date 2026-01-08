@@ -167,7 +167,8 @@ class VizDoomEnv:
         action_len = len(btns)
         if action_len != self._action_space.size:
             raise RuntimeError(
-                f"Available buttons size {action_len} does not match action space size {self._action_space.size}"
+                f"Available buttons size "
+                f"{action_len} does not match action space size {self._action_space.size}"
             )
 
         for _ in range(max_tics):
@@ -280,7 +281,7 @@ def _self_test() -> None:
     env = VizDoomEnv(cfg_path=os.path.join("scenarios", "basic_movement.cfg"))
     try:
         env.init(window_visible=True, seed=12345)
-        controller = ScriptedController(space := canonical_action_space())
+        controller = ScriptedController(canonical_action_space())
         # Run 5 tics only
         it = env.run(session_id="selftest", controller=controller, max_tics=5, player_id="p1")
         for s in it:
