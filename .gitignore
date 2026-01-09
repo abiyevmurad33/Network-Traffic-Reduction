@@ -29,3 +29,14 @@ Thumbs.db
 freedoom2.wad
 doom.wad
 doom2.wad
+
+# Raw logs (generated)
+data/raw_logs/
+data/**/raw_logs/
+
+# Temp outputs
+*.tmp
+
+# Aggregated evaluation outputs (generated)
+results/
+data/analysis/
