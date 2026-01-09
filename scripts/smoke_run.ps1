@@ -1,4 +1,4 @@
-# Smoke run: run a short Tier A session and validate outputs.
+# Smoke run: run short Tier A sessions and validate outputs (multiple scenarios).
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\smoke_run.ps1
 # Optional:
@@ -20,47 +20,78 @@ function Fail($msg) {
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
 
-# Deterministic session id for easy lookup (UTC timestamp)
-$Ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
-$SID = "session_smoke_$Ts"
-$SessionDir = Join-Path $RepoRoot (Join-Path "data\raw_logs" $SID)
-
 Write-Host "RepoRoot:     $RepoRoot"
-Write-Host "SessionID:    $SID"
-Write-Host "SessionDir:   $SessionDir"
 Write-Host "Headless:     $Headless"
 Write-Host ""
 
-# Build logger command
-$LoggerArgs = @(
-    "-m", "src.logger.run_logger",
-    "--duration-seconds", "10",
-    "--protocol-tier", "A",
-    "--seed", "12345",
-    "--session-id", $SID
-)
+# Deterministic session id base for easy lookup (UTC timestamp)
+$Ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
 
-if ($Headless) {
-    $LoggerArgs += "--headless"
+function Run-One([string]$Suffix, [string]$ScenarioCfg, [string]$Profile) {
+    $SID = "session_smoke_$Suffix" + "_" + $Ts
+    $SessionDir = Join-Path $RepoRoot (Join-Path "data\raw_logs" $SID)
+
+    Write-Host "------------------------------------------------------------"
+    Write-Host "SessionID:    $SID"
+    Write-Host "Scenario:     $ScenarioCfg"
+    Write-Host "Profile:      $Profile"
+    Write-Host "SessionDir:   $SessionDir"
+    Write-Host ""
+
+    $LoggerArgs = @(
+        "-m", "src.logger.run_logger",
+        "--duration-seconds", "10",
+        "--protocol-tier", "A",
+        "--seed", "12345",
+        "--session-id", $SID,
+        "--scenario-config", $ScenarioCfg,
+        "--profile", $Profile
+    )
+
+    if ($Headless) {
+        $LoggerArgs += "--headless"
+    }
+    else {
+        $LoggerArgs += "--window-visible"
+    }
+
+    Write-Host "Running logger..."
+    # IMPORTANT: Pipe external program output to Out-Host so it does NOT become function output.
+    & python @LoggerArgs | Out-Host
+    if ($LASTEXITCODE -ne 0) { Fail "Logger failed with exit code $LASTEXITCODE" }
+
+    Write-Host ""
+    Write-Host "Running validator..."
+    & python -m scripts.validate_log $SessionDir | Out-Host
+    if ($LASTEXITCODE -ne 0) { Fail "Validator failed with exit code $LASTEXITCODE" }
+
+    Write-Host ""
+    Write-Host "PASS for $SID"
+
+    # Return ONLY the session dir (no other pipeline output)
+    return $SessionDir
 }
-else {
-    $LoggerArgs += "--window-visible"
-}
 
-Write-Host "Running logger..."
-python @LoggerArgs
-if ($LASTEXITCODE -ne 0) { Fail "Logger failed with exit code $LASTEXITCODE" }
+# Run both scenarios
+$dir1 = Run-One "basic"  "scenarios\basic_movement.cfg" "basic_move"
+$dir2 = Run-One "strafe" "scenarios\strafe_turn.cfg"    "strafe_turn"
+$dir3 = Run-One "combat" "scenarios\combat_proxy.cfg" "combat_burst"
 
-# Validate
 Write-Host ""
-Write-Host "Running validator..."
-python -m scripts.validate_log $SessionDir
-if ($LASTEXITCODE -ne 0) { Fail "Validator failed with exit code $LASTEXITCODE" }
+Write-Host "Smoke run PASS (all)."
+Write-Host "Basic session:  $dir1"
+Write-Host "Strafe session: $dir2"
+Write-Host "Combat session: $dir3"
 
-# Print quick metadata preview
 Write-Host ""
-Write-Host "Smoke run PASS."
-Write-Host "SessionDir: $SessionDir"
+Write-Host "basic session.json (first 20 lines):"
+Get-Content -LiteralPath (Join-Path $dir1 "session.json") -TotalCount 20
+
 Write-Host ""
-Write-Host "session.json (first 30 lines):"
-Get-Content (Join-Path $SessionDir "session.json") -TotalCount 30
+Write-Host "strafe session.json (first 20 lines):"
+Get-Content -LiteralPath (Join-Path $dir2 "session.json") -TotalCount 20
+
+Write-Host ""
+Write-Host "combat session.json (first 20 lines):"
+Get-Content -LiteralPath (Join-Path $dir3 "session.json") -TotalCount 20
+

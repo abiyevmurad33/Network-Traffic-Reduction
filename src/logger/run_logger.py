@@ -7,7 +7,12 @@ import sys
 from pathlib import Path
 
 from src.logger.action_space import canonical_action_space
-from src.logger.controller import ScriptedController
+from src.logger.controller_profiles import (
+    BasicMoveProfile,
+    CombatBurstProfile,
+    ProfiledScriptedController,
+    StrafeTurnProfile,
+)
 from src.logger.vizdoom_env import VizDoomEnv
 from src.utils.paths import atomic_replace, build_session_paths, ensure_dir, repo_root_from_file
 from src.utils.time_id import make_session_id, utc_now_iso
@@ -27,6 +32,14 @@ CSV_HEADER = [
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run a deterministic ViZDoom logging session (v1).")
+
+    p.add_argument(
+        "--profile",
+        type=str,
+        default="basic_move",
+        choices=["basic_move", "strafe_turn", "combat_burst"],
+        help="Deterministic controller profile (default: basic_move).",
+    )
 
     p.add_argument(
         "--scenario-config",
@@ -110,7 +123,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # Prepare controller and env
     action_space = canonical_action_space()
-    controller = ScriptedController(action_space)
+
+    if args.profile == "basic_move":
+        profile = BasicMoveProfile()
+    elif args.profile == "strafe_turn":
+        profile = StrafeTurnProfile()
+    elif args.profile == "combat_burst":
+        profile = CombatBurstProfile()
+    else:
+        raise RuntimeError(f"Unknown profile: {args.profile!r}")
+
+    controller = ProfiledScriptedController(action_space, profile)
 
     env = VizDoomEnv(cfg_path=str(scenario_cfg), iwad_required_path=str(iwad_path))
 
@@ -182,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             "protocol_tier": args.protocol_tier,
             "warmup_seconds": 0,
             "players": [
-                {"player_id": "p1", "controller": "script", "notes": ""},
+                {"player_id": "p1", "controller": "script", "notes": f"profile={args.profile}"},
             ],
             "action_space": action_space.to_metadata(),
             "ended_early": ended_early,
