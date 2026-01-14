@@ -1,0 +1,52 @@
+#library "BHVLOG"
+
+#include "zcommon.acs"
+
+int g_enabled = 1;
+
+script 900 (void) CLIENTSIDE
+{
+    g_enabled = 1 - g_enabled;
+    Log(s:"bhvlog: enabled=", d:g_enabled);
+}
+
+script 1 ENTER CLIENTSIDE
+
+{
+    Log(s:"#ZTRACE tic x y z yaw_deg pitch_deg buttons");
+
+    while (TRUE)
+    {
+        if (g_enabled)
+        {
+            int tic = Timer();
+
+            // Fixed-point values stored in int (16.16)
+            int x = GetActorX(0);
+            int y = GetActorY(0);
+            int z = GetActorZ(0);
+
+            // Angles are fixed-point "turns" (1.0 turn == 360 degrees)
+            int yaw_turns = GetActorAngle(0);
+            int pitch_turns = GetActorPitch(0);
+
+            // turns -> degrees (still fixed-point)
+            int yaw_deg = FixedMul(yaw_turns, 360.0);
+            int pitch_deg = FixedMul(pitch_turns, 360.0);
+
+            int buttons = GetPlayerInput(-1, INPUT_BUTTONS);
+
+            Log(
+                s:"ZTRACE tic=", d:tic,
+                s:" x=", f:x,
+                s:" y=", f:y,
+                s:" z=", f:z,
+                s:" yaw_deg=", f:yaw_deg,
+                s:" pitch_deg=", f:pitch_deg,
+                s:" buttons=", d:buttons
+            );
+        }
+
+        Delay(1);
+    }
+}
