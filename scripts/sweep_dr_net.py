@@ -7,7 +7,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.eval.net_sim import DRConfig, NetConfig, State, evaluate_dr_under_network
+from src.eval.net_sim import (
+    DRConfig,
+    NetConfig,
+    State,
+    evaluate_predictor_under_network,
+)
+from src.predictors.dr_predictor import DRPredictor
 
 
 @dataclass(frozen=True)
@@ -89,11 +95,18 @@ def parse_profile(meta: dict) -> str:
     return "unknown"
 
 
-def load_states(session_dir: Path) -> list[State]:
+def load_states(session_dir: Path) -> tuple[list[State], list[int]]:
     p = session_dir / "states.csv"
     out: list[State] = []
+    action_masks: list[int] = []
     with p.open("r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
+        mask_col = None
+        if r.fieldnames is not None:
+            if "action_mask" in r.fieldnames:
+                mask_col = "action_mask"
+            elif "mask" in r.fieldnames:
+                mask_col = "mask"
         for row in r:
             out.append(
                 State(
@@ -105,9 +118,13 @@ def load_states(session_dir: Path) -> list[State]:
                     pitch=float(row["pitch_deg"]),
                 )
             )
+            if mask_col is None:
+                action_masks.append(0)
+            else:
+                action_masks.append(int(row[mask_col]))
     if len(out) < 2:
         raise ValueError(f"Need at least 2 rows in {p}")
-    return out
+    return out, action_masks
 
 
 def iter_session_dirs(root: Path, glob_pattern: str) -> Iterable[Path]:
@@ -189,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             # Prefer session.json tps if present, else default 35
             tps = float(meta.get("tics_per_second", 35.0))
 
-            states = load_states(sd)
+            states, action_masks = load_states(sd)
 
             for preset in NET_PRESETS:
                 for interval in intervals:
@@ -213,7 +230,13 @@ def main(argv: list[str] | None = None) -> int:
                                     rng_seed=int(args.seed),
                                 )
 
-                                summary = evaluate_dr_under_network(states, dr_cfg, net_cfg)
+                                summary = evaluate_predictor_under_network(
+                                    states=states,
+                                    action_masks=action_masks,
+                                    predictor=DRPredictor(),
+                                    dr_cfg=dr_cfg,
+                                    net_cfg=net_cfg,
+                                )
 
                                 w.writerow(
                                     {

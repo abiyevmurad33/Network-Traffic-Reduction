@@ -40,3 +40,28 @@ data/**/raw_logs/
 # Aggregated evaluation outputs (generated)
 results/
 data/analysis/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv/**
+.env
+
+# Local configs / runtime
+_vizdoom.ini
+
+# Outputs / artifacts
+models/
+results/
+data/
+data/**
+
+# Zandronum generated/build/runtime
+zandronum/logs/
+zandronum/mod_build/
+zandronum/mod_src/acs/
+zandronum/mod_src/*.o
+
+# Third-party tools/binaries (do not version)
+zandronum/tools/

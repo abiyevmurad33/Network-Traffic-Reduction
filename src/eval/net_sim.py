@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from src.predictors.base import Obs, Predictor
+from src.predictors.dr_predictor import DRPredictor
 from src.utils.angles import circular_abs_error_deg, circular_diff_deg
 
 
@@ -107,6 +109,14 @@ def _tic_to_time_s(tic: int, tps: float) -> float:
     return float(tic) / float(tps)
 
 
+def baseline_traffic(states: Sequence[State], net_cfg: NetConfig) -> tuple[int, int]:
+    # Baseline: send full state each tic (same size model)
+    baseline_packets = len(states)
+    msg_size = int(net_cfg.header_bytes + net_cfg.payload_bytes_state)
+    baseline_bytes = baseline_packets * msg_size
+    return baseline_packets, baseline_bytes
+
+
 def _estimate_rates(prev: State | None, last: State) -> tuple[float, float, float, float, float]:
     if prev is None:
         return 0.0, 0.0, 0.0, 0.0, 0.0
@@ -123,6 +133,18 @@ def _estimate_rates(prev: State | None, last: State) -> tuple[float, float, floa
     dpitch = circular_diff_deg(last.pitch, prev.pitch)
 
     return vx, vy, vz, dyaw / dt, dpitch / dt
+
+
+def _state_to_obs(s: State, action_mask: int) -> Obs:
+    return Obs(
+        tic=s.tic,
+        x=s.x,
+        y=s.y,
+        z=s.z,
+        yaw=s.yaw,
+        pitch=s.pitch,
+        action_mask=action_mask,
+    )
 
 
 def _predict(from_state: State, rates: tuple[float, float, float, float, float], tic: int) -> State:
@@ -194,6 +216,68 @@ def plan_dr_sends(states: Sequence[State], cfg: DRConfig) -> list[SendEvent]:
             rates = _estimate_rates(prev_auth, last_auth)
 
     return events
+
+
+def plan_predictor_sends(
+    states: Sequence[State],
+    action_masks: Sequence[int],
+    predictor: Predictor,
+    cfg: DRConfig,
+) -> list[SendEvent]:
+    """
+    Generic send schedule planner:
+    - simulate client prediction tick-by-tick using predictor + actions
+    - send periodic updates every K tics since last send
+    - send correction if prediction error exceeds thresholds
+    """
+    if len(states) != len(action_masks):
+        raise ValueError("states and action_masks must have equal length")
+    if len(states) < 2:
+        raise ValueError("Need at least 2 states")
+
+    predictor.reset()
+
+    events: list[SendEvent] = []
+    last_send_tic = states[0].tic
+
+    # Initial authoritative send
+    events.append(SendEvent(send_tic=states[0].tic, kind="initial", state=states[0]))
+
+    # Client starts from the authoritative initial state
+    predictor.observe(_state_to_obs(states[0], action_masks[0]))
+
+    for i in range(1, len(states)):
+        gt = states[i]
+
+        # advance predictor exactly one tic using action at previous tic
+        pred_obs = predictor.step(action_masks[i - 1])
+
+        pos_err = _euclid3(pred_obs.x - gt.x, pred_obs.y - gt.y, pred_obs.z - gt.z)
+        yaw_err = circular_abs_error_deg(pred_obs.yaw, gt.yaw)
+        pitch_err = circular_abs_error_deg(pred_obs.pitch, gt.pitch)
+
+        need_periodic = (gt.tic - last_send_tic) >= cfg.update_interval_tics
+        need_correction = (
+            pos_err > cfg.pos_eps or yaw_err > cfg.yaw_eps_deg or pitch_err > cfg.pitch_eps_deg
+        )
+
+        if need_correction:
+            events.append(SendEvent(send_tic=gt.tic, kind="correction", state=gt))
+            last_send_tic = gt.tic
+            predictor.reset()
+            predictor.observe(_state_to_obs(gt, action_masks[i]))
+            continue
+
+        if need_periodic:
+            events.append(SendEvent(send_tic=gt.tic, kind="periodic", state=gt))
+            last_send_tic = gt.tic
+            predictor.reset()
+            predictor.observe(_state_to_obs(gt, action_masks[i]))
+            continue
+    return events
+    # If no send, continue predicting next tic on next loop
+    # Ensure predictor has correct action_mask for current predicted obs
+    # (pred_obs already stores action_mask used for the step)
 
 
 def simulate_network_delivery(
@@ -342,7 +426,8 @@ def simulate_client_error(
             idx += 1
 
         if last_recv is None:
-            # No update has arrived yet; client has no state -> treat as predicting from first gt (idealized start).
+            # No update has arrived yet; client has no state ->
+            # treat as predicting from first gt (idealized start).
             # This keeps the metric finite and isolates network effects after first delivery.
             last_recv = states[0]
             prev_recv = None
@@ -353,6 +438,93 @@ def simulate_client_error(
         pos_err = _euclid3(pred.x - gt.x, pred.y - gt.y, pred.z - gt.z)
         yaw_err = circular_abs_error_deg(pred.yaw, gt.yaw)
         pitch_err = circular_abs_error_deg(pred.pitch, gt.pitch)
+
+        pos_sum += pos_err
+        yaw_sum += yaw_err
+        pitch_sum += pitch_err
+        cnt += 1
+
+        pos_max = max(pos_max, pos_err)
+        yaw_max = max(yaw_max, yaw_err)
+        pitch_max = max(pitch_max, pitch_err)
+
+    return ClientErrorSummary(
+        pos_mae=pos_sum / max(cnt, 1),
+        yaw_mae_deg=yaw_sum / max(cnt, 1),
+        pitch_mae_deg=pitch_sum / max(cnt, 1),
+        pos_max=pos_max,
+        yaw_max_deg=yaw_max,
+        pitch_max_deg=pitch_max,
+    )
+
+
+def simulate_client_error_with_predictor(
+    states: Sequence[State],
+    action_masks: Sequence[int],
+    arrivals: Sequence[ArrivalEvent],
+    predictor: Predictor,
+    tps: float,
+) -> ClientErrorSummary:
+    """
+    Client applies delivered authoritative updates on arrival_time_s.
+    Between updates, client predicts per tic using predictor.step(action_mask).
+
+    We model "apply update at arrival time, then fast-forward to current tic"
+    (no rollback reconciliation), consistent with our current evaluation simplification.
+    """
+    if len(states) != len(action_masks):
+        raise ValueError("states and action_masks must have equal length")
+    if len(states) < 2:
+        raise ValueError("Need at least 2 states")
+    if tps <= 0:
+        raise ValueError("tics_per_second must be > 0")
+
+    delivered = [a for a in arrivals if not a.dropped]
+    delivered.sort(key=lambda a: a.arrival_time_s)
+
+    # Index ground-truth by tic (assumes strictly increasing, 1-tic steps)
+    tic0 = states[0].tic
+    by_tic = {s.tic: s for s in states}
+    mask_by_tic = {states[i].tic: action_masks[i] for i in range(len(states))}
+
+    predictor.reset()
+
+    # Initialize client at first ground-truth state (idealized start)
+    cur_tic = tic0
+    predictor.observe(_state_to_obs(by_tic[cur_tic], mask_by_tic[cur_tic]))
+    client_obs = _state_to_obs(by_tic[cur_tic], mask_by_tic[cur_tic])
+
+    idx = 0
+
+    pos_sum = yaw_sum = pitch_sum = 0.0
+    pos_max = yaw_max = pitch_max = 0.0
+    cnt = 0
+
+    for gt in states:
+        now_s = _tic_to_time_s(gt.tic, tps)
+
+        # Apply any arrivals that have arrived by now
+        while idx < len(delivered) and delivered[idx].arrival_time_s <= now_s:
+            upd_state = delivered[idx].state
+            if upd_state.tic in by_tic:
+                # Apply correction "now" using authoritative pose at upd_state.tic
+                predictor.reset()
+                cur_tic = upd_state.tic
+                client_obs = _state_to_obs(by_tic[cur_tic], mask_by_tic.get(cur_tic, 0))
+                predictor.observe(client_obs)
+            idx += 1
+
+        # Fast-forward client to current ground-truth tic
+        while cur_tic < gt.tic:
+            # Some logs/sessions may have missing tics (dropped lines).
+            # Treat missing masks as "no input".
+            am = mask_by_tic.get(cur_tic, 0)
+            client_obs = predictor.step(am)
+            cur_tic = client_obs.tic
+
+        pos_err = _euclid3(client_obs.x - gt.x, client_obs.y - gt.y, client_obs.z - gt.z)
+        yaw_err = circular_abs_error_deg(client_obs.yaw, gt.yaw)
+        pitch_err = circular_abs_error_deg(client_obs.pitch, gt.pitch)
 
         pos_sum += pos_err
         yaw_sum += yaw_err
@@ -389,6 +561,9 @@ def evaluate_dr_under_network(
         raise ValueError("Need at least 2 states")
 
     dr_events = plan_dr_sends(states, dr_cfg)
+    if not isinstance(dr_events, list):
+        raise RuntimeError("plan_dr_sends did not return a list of SendEvent")
+
     arrivals, net_summary = simulate_network_delivery(dr_events, net_cfg)
     client_err = simulate_client_error(states, arrivals, net_cfg.tics_per_second)
 
@@ -397,6 +572,127 @@ def evaluate_dr_under_network(
     msg_size = int(net_cfg.header_bytes + net_cfg.payload_bytes_state)
     baseline_bytes = baseline_packets * msg_size
 
+    dr_packets = net_summary.sent_packets
+    dr_bytes = net_summary.sent_bytes
+
+    savings_packets = 1.0 - (dr_packets / baseline_packets) if baseline_packets > 0 else 0.0
+    savings_bytes = 1.0 - (dr_bytes / baseline_bytes) if baseline_bytes > 0 else 0.0
+
+    action_masks = [0 for _ in states]
+    dr_pred = DRPredictor()
+    dr_events = plan_predictor_sends(states, action_masks, dr_pred, dr_cfg)
+    arrivals, net_summary = simulate_network_delivery(dr_events, net_cfg)
+    client_err = simulate_client_error_with_predictor(
+        states, action_masks, arrivals, DRPredictor(), net_cfg.tics_per_second
+    )
+
+    # IMPORTANT: Make DR packet/byte counts consistent with the predictor-based run.
+    dr_packets = net_summary.sent_packets
+    dr_bytes = net_summary.sent_bytes
+
+    savings_packets = 1.0 - (dr_packets / baseline_packets) if baseline_packets > 0 else 0.0
+    savings_bytes = 1.0 - (dr_bytes / baseline_bytes) if baseline_bytes > 0 else 0.0
+
+    return DRNetSummary(
+        n_tics=len(states),
+        dr_send_packets=dr_packets,
+        dr_send_bytes=dr_bytes,
+        baseline_send_packets=baseline_packets,
+        baseline_send_bytes=baseline_bytes,
+        savings_ratio_packets=savings_packets,
+        savings_ratio_bytes=savings_bytes,
+        net=net_summary,
+        client_error=client_err,
+    )
+
+
+def evaluate_predictor_under_network_factory(
+    states: Sequence[State],
+    action_masks: Sequence[int],
+    predictor_factory: Callable[[], Predictor],
+    dr_cfg: DRConfig,
+    net_cfg: NetConfig,
+) -> DRNetSummary:
+    if len(states) != len(action_masks):
+        raise ValueError("states and action_masks must have equal length")
+    if len(states) < 2:
+        raise ValueError("Need at least 2 states")
+
+    server_pred = predictor_factory()
+    events = plan_predictor_sends(states, action_masks, server_pred, dr_cfg)
+    if not isinstance(events, list):
+        raise RuntimeError("plan_predictor_sends did not return a list of SendEvent")
+
+    arrivals, net_summary = simulate_network_delivery(events, net_cfg)
+
+    client_pred = predictor_factory()
+    client_err = simulate_client_error_with_predictor(
+        states=states,
+        action_masks=action_masks,
+        arrivals=arrivals,
+        predictor=client_pred,
+        tps=net_cfg.tics_per_second,
+    )
+
+    baseline_packets, baseline_bytes = baseline_traffic(states, net_cfg)
+
+    dr_packets = net_summary.sent_packets
+    dr_bytes = net_summary.sent_bytes
+
+    savings_packets = 1.0 - (dr_packets / baseline_packets) if baseline_packets > 0 else 0.0
+    savings_bytes = 1.0 - (dr_bytes / baseline_bytes) if baseline_bytes > 0 else 0.0
+
+    return DRNetSummary(
+        n_tics=len(states),
+        dr_send_packets=dr_packets,
+        dr_send_bytes=dr_bytes,
+        baseline_send_packets=baseline_packets,
+        baseline_send_bytes=baseline_bytes,
+        savings_ratio_packets=savings_packets,
+        savings_ratio_bytes=savings_bytes,
+        net=net_summary,
+        client_error=client_err,
+    )
+
+
+def evaluate_predictor_under_network(
+    states: Sequence[State],
+    action_masks: Sequence[int],
+    predictor: Predictor,
+    dr_cfg: DRConfig,
+    net_cfg: NetConfig,
+) -> DRNetSummary:
+    """
+    Generic evaluator: same structure as evaluate_dr_under_network, but uses:
+    - action_masks for prediction steps
+    - arbitrary Predictor implementation
+    """
+    if len(states) != len(action_masks):
+        raise ValueError("states and action_masks must have equal length")
+    if len(states) < 2:
+        raise ValueError("Need at least 2 states")
+
+    # 1) Plan server sends based on predictor divergence (corrections) + periodic updates
+    events = plan_predictor_sends(states, action_masks, predictor, dr_cfg)
+    if not isinstance(events, list):
+        raise RuntimeError("plan_predictor_sends did not return a list of SendEvent")
+
+    # 2) Deliver them through network model
+    arrivals, net_summary = simulate_network_delivery(events, net_cfg)
+
+    # 3) Simulate client error using predictor between delivered updates
+    client_err = simulate_client_error_with_predictor(
+        states=states,
+        action_masks=action_masks,
+        arrivals=arrivals,
+        predictor=predictor.__class__(),  # fresh predictor instance for client sim
+        tps=net_cfg.tics_per_second,
+    )
+
+    # 4) Baseline traffic (same definition as evaluate_dr_under_network)
+    baseline_packets, baseline_bytes = baseline_traffic(states, net_cfg)
+
+    # Use net_summary for sent bytes/packets (consistent with evaluate_dr_under_network)
     dr_packets = net_summary.sent_packets
     dr_bytes = net_summary.sent_bytes
 

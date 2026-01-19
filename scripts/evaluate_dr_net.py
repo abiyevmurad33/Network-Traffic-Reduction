@@ -6,17 +6,25 @@ import json
 import sys
 from pathlib import Path
 
-from src.eval.net_sim import DRConfig, NetConfig, State, evaluate_dr_under_network
+from src.eval.net_sim import DRConfig, NetConfig, State, evaluate_predictor_under_network
+from src.predictors.dr_predictor import DRPredictor
 
 
-def load_states(session_dir: Path) -> list[State]:
+def load_states(session_dir: Path) -> tuple[list[State], list[int]]:
     p = session_dir / "states.csv"
     if not p.exists():
         raise FileNotFoundError(f"Missing {p}")
 
     out: list[State] = []
+    action_masks: list[int] = []
     with p.open("r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
+        mask_col: str | None = None
+        if r.fieldnames is not None:
+            if "action_mask" in r.fieldnames:
+                mask_col = "action_mask"
+            elif "mask" in r.fieldnames:
+                mask_col = "mask"
         for row in r:
             out.append(
                 State(
@@ -28,9 +36,15 @@ def load_states(session_dir: Path) -> list[State]:
                     pitch=float(row["pitch_deg"]),
                 )
             )
+            if mask_col is None:
+                action_masks.append(0)
+            else:
+                action_masks.append(int(row[mask_col]))
+
     if len(out) < 2:
         raise ValueError("Need at least 2 rows in states.csv")
-    return out
+
+    return out, action_masks
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -77,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: session_dir does not exist: {session_dir}", file=sys.stderr)
         return 2
 
-    states = load_states(session_dir)
+    states, action_masks = load_states(session_dir)
 
     dr_cfg = DRConfig(
         update_interval_tics=int(args.interval),
@@ -96,7 +110,13 @@ def main(argv: list[str] | None = None) -> int:
         rng_seed=int(args.seed),
     )
 
-    summary = evaluate_dr_under_network(states, dr_cfg, net_cfg)
+    summary = evaluate_predictor_under_network(
+        states=states,
+        action_masks=action_masks,
+        predictor=DRPredictor(),
+        dr_cfg=dr_cfg,
+        net_cfg=net_cfg,
+    )
 
     payload = {
         "method": "dead_reckoning_net_v1",
