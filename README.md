@@ -108,4 +108,4 @@ This repository supports the master’s thesis *“Reducing Network Traffic in F
 
 Murad Abiyev  
 Master’s student, Artificial Intelligence  
-Supervisor: [Name]
+Supervisor: Tautvydas Fyleris
